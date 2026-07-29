@@ -52,6 +52,7 @@ func usage() {
     println("mfltok -- BPE tokenizer (pure MFL)")
     println("")
     println("  mfltok count  [--vocab NAME] [FILE]   token count as JSON")
+    println("  mfltok countmany [--vocab NAME]       paths on stdin -> JSON array")
     println("  mfltok encode [--vocab NAME] [FILE]   token ids as JSON")
     println("  mfltok selftest FIXTURE [--vocab N]   check against expected ids")
     println("")
@@ -103,6 +104,25 @@ func main() {
             exit(2)
         }
         run_selftest(file, load_ms)
+        return
+    }
+
+    if cmd == "countmany" {
+        // One vocab load, many files: paths on stdin (one per line), a JSON
+        // array out. A per-file exec would pay the rank-table load every time.
+        plist := split(read_stdin(), "\n")
+        rows := []string{}
+        pi := 0
+        for pi < len(plist) {
+            fp := plist[pi]
+            if fp != "" {
+                fb := read_file_bytes(fp)
+                fids := encode_text(fb)
+                rows = append(rows, "{\"path\":" + json(fp) + ",\"bytes\":" + str(len(fb)) + ",\"tokens\":" + str(len(fids)) + "}")
+            }
+            pi = pi + 1
+        }
+        println("{\"vocab\":\"" + vocab + "\",\"files\":[" + join(rows, ",") + "]}")
         return
     }
 
