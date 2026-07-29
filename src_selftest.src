@@ -1,0 +1,79 @@
+// Conformance harness.
+//
+// Fixture format, one case per line: "<base64(text)> <id,id,id,...>"
+// base64 sidesteps every escaping question (newlines, NULs, invalid UTF-8),
+// so the fixture is exactly the bytes tiktoken saw.
+
+func run_selftest(path, load_ms) {
+    raw := read_file_bytes(path)
+    if len(raw) == 0 {
+        println("error: empty or missing fixture " + path)
+        exit(3)
+    }
+    nl := bytes("\n")
+    sp := bytes(" ")
+    total := len(raw)
+
+    cases := 0
+    passed := 0
+    failed := 0
+    lines := 0
+    skipped := 0
+    firstbad := ""
+
+    pos := 0
+    for pos < total {
+        e := bytes_index(raw, nl, pos)
+        if e < 0 {
+            e = total
+        }
+        if e > pos {
+            lines = lines + 1
+            cut0 := bytes_index(raw, sp, pos)
+            if cut0 <= pos || cut0 >= e {
+                skipped = skipped + 1
+            }
+            cut := bytes_index(raw, sp, pos)
+            if cut > pos && cut < e {
+                b64 := bytes_str(bytes_sub(raw, pos, cut))
+                want := bytes_str(bytes_sub(raw, cut+1, e))
+                text := base64_decode_bytes(b64)
+                got := encode_text(text)
+
+                parts := split(want, ",")
+                same := len(parts) == len(got)
+                if same {
+                    k := 0
+                    for k < len(got) {
+                        if parse_int(parts[k]) != got[k] {
+                            same = false
+                        }
+                        k = k + 1
+                    }
+                }
+                cases = cases + 1
+                if same {
+                    passed = passed + 1
+                } else {
+                    failed = failed + 1
+                    if firstbad == "" {
+                        firstbad = b64 + " want=" + want + " got=" + ints_json(got)
+                    }
+                }
+            }
+        }
+        pos = e + 1
+    }
+
+    // `lines` and `skipped` are reported so a fixture that silently fails to
+    // parse can never masquerade as a clean run.
+    ok := "false"
+    if failed == 0 && skipped == 0 && cases > 0 {
+        ok = "true"
+    }
+    println("{\"ok\":" + ok + ",\"cases\":" + str(cases) + ",\"passed\":" + str(passed) + ",\"failed\":" + str(failed) + ",\"lines\":" + str(lines) + ",\"skipped\":" + str(skipped) + ",\"load_ms\":" + str(load_ms) + "}")
+    if failed != 0 {
+        println("first failure: " + firstbad)
+        exit(4)
+    }
+}

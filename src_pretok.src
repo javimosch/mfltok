@@ -1,0 +1,260 @@
+// cl100k_base pretokenizer, hand-rolled.
+//
+// The reference pattern is
+//   (?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\r\n\p{L}\p{N}]?\p{L}+|\p{N}{1,3}
+//   | ?[^\s\p{L}\p{N}]+[\r\n]*|\s*[\r\n]|\s+(?!\S)|\s+
+// which needs Unicode classes and a negative lookahead. POSIX ERE (machin's
+// regex_* builtins) has neither, so we implement the alternation directly:
+// alternatives are tried in order and the first that matches at the current
+// position wins, exactly as a regex alternation would.
+
+// --- UTF-8 -------------------------------------------------------------
+
+// Decode one codepoint. MULTI-ASSIGN: cp, w := utf8_at(b, i)
+// An invalid lead byte decodes as itself with width 1, matching how the
+// reference tokenizers treat lone bytes in otherwise-valid input.
+func utf8_at(b, i) (cp, w) {
+    n := len(b)
+    cp = -1
+    w = 1
+    if i >= n {
+        return cp, w
+    }
+    b0 := byte_at(b, i)
+    if b0 < 128 {
+        cp = b0
+        w = 1
+        return cp, w
+    }
+    if b0 >= 240 {
+        if i+3 < n {
+            cp = ((b0 - 240) * 262144) + ((byte_at(b, i+1) - 128) * 4096) + ((byte_at(b, i+2) - 128) * 64) + (byte_at(b, i+3) - 128)
+            w = 4
+            return cp, w
+        }
+    }
+    if b0 >= 224 {
+        if i+2 < n {
+            cp = ((b0 - 224) * 4096) + ((byte_at(b, i+1) - 128) * 64) + (byte_at(b, i+2) - 128)
+            w = 3
+            return cp, w
+        }
+    }
+    if b0 >= 192 {
+        if i+1 < n {
+            cp = ((b0 - 192) * 64) + (byte_at(b, i+1) - 128)
+            w = 2
+            return cp, w
+        }
+    }
+    cp = b0
+    w = 1
+}
+
+// --- Unicode classes ---------------------------------------------------
+
+func uni_in(tbl, cp) (found) {
+    lo := 0
+    hi := len(tbl)/2 - 1
+    found = false
+    for lo <= hi {
+        mid := (lo + hi) / 2
+        if cp < tbl[mid*2] {
+            hi = mid - 1
+        } else {
+            if cp > tbl[mid*2+1] {
+                lo = mid + 1
+            } else {
+                found = true
+                return found
+            }
+        }
+    }
+}
+
+func is_letter(cp) (r) { r = uni_in(uni_letter, cp) }
+func is_number(cp) (r) { r = uni_in(uni_number, cp) }
+func is_space(cp) (r)  { r = uni_in(uni_space, cp) }
+func is_nl(cp) (r)     { r = cp == 10 || cp == 13 }
+
+// --- the alternation ---------------------------------------------------
+
+// End offset of the pretoken starting at i (always > i for i < len(b)).
+func pretok_end(b, i) (end) {
+    n := len(b)
+    end = i
+    if i >= n {
+        return end
+    }
+
+    cp := 0
+    w := 0
+    cp, w = utf8_at(b, i)
+
+    // 1. (?i:'s|'t|'re|'ve|'m|'ll|'d)
+    if cp == 39 && i+1 < n {
+        c1 := 0
+        w1 := 0
+        c1, w1 = utf8_at(b, i+1)
+        l1 := c1
+        if l1 >= 65 && l1 <= 90 {
+            l1 = l1 + 32
+        }
+        if l1 == 115 || l1 == 116 || l1 == 109 || l1 == 100 {
+            end = i + 1 + w1
+            return end
+        }
+        if l1 == 114 || l1 == 118 || l1 == 108 {
+            if i+2 < n {
+                c2 := 0
+                w2 := 0
+                c2, w2 = utf8_at(b, i+2)
+                l2 := c2
+                if l2 >= 65 && l2 <= 90 {
+                    l2 = l2 + 32
+                }
+                ok := false
+                if l1 == 114 && l2 == 101 { ok = true }
+                if l1 == 118 && l2 == 101 { ok = true }
+                if l1 == 108 && l2 == 108 { ok = true }
+                if ok {
+                    end = i + 1 + w1 + w2
+                    return end
+                }
+            }
+        }
+    }
+
+    // 2. [^\r\n\p{L}\p{N}]?\p{L}+
+    p := i
+    pc := cp
+    pw := w
+    if !is_nl(pc) && !is_letter(pc) && !is_number(pc) {
+        // optional single leading char, then at least one letter must follow
+        nc := 0
+        nw := 0
+        nc, nw = utf8_at(b, i+w)
+        if i+w < n && is_letter(nc) {
+            p = i + w
+            pc = nc
+            pw = nw
+        }
+    }
+    if is_letter(pc) {
+        q := p
+        qc := pc
+        qw := pw
+        for q < n && is_letter(qc) {
+            q = q + qw
+            qc, qw = utf8_at(b, q)
+        }
+        end = q
+        return end
+    }
+
+    // 3. \p{N}{1,3}
+    if is_number(cp) {
+        cnt := 0
+        q3 := i
+        c3 := cp
+        w3 := w
+        for q3 < n && is_number(c3) && cnt < 3 {
+            q3 = q3 + w3
+            cnt = cnt + 1
+            c3, w3 = utf8_at(b, q3)
+        }
+        end = q3
+        return end
+    }
+
+    // 4.  ?[^\s\p{L}\p{N}]+[\r\n]*
+    s4 := i
+    c4 := cp
+    w4 := w
+    if cp == 32 {
+        nc4 := 0
+        nw4 := 0
+        nc4, nw4 = utf8_at(b, i+1)
+        if i+1 < n && !is_space(nc4) && !is_letter(nc4) && !is_number(nc4) {
+            s4 = i + 1
+            c4 = nc4
+            w4 = nw4
+        }
+    }
+    if s4 < n && !is_space(c4) && !is_letter(c4) && !is_number(c4) {
+        q4 := s4
+        d4 := c4
+        v4 := w4
+        for q4 < n && !is_space(d4) && !is_letter(d4) && !is_number(d4) {
+            q4 = q4 + v4
+            d4, v4 = utf8_at(b, q4)
+        }
+        for q4 < n && is_nl(d4) {
+            q4 = q4 + v4
+            d4, v4 = utf8_at(b, q4)
+        }
+        end = q4
+        return end
+    }
+
+    // 5-7 all require whitespace at i.
+    if !is_space(cp) {
+        // Unreachable for well-formed input: every codepoint is a letter,
+        // number, whitespace, or "other" (covered by 4). Consume one
+        // codepoint so we can never loop forever.
+        end = i + w
+        return end
+    }
+
+    // span of the whitespace run
+    runend := i
+    rc := cp
+    rw := w
+    for runend < n && is_space(rc) {
+        runend = runend + rw
+        rc, rw = utf8_at(b, runend)
+    }
+
+    // 5. \s*[\r\n]  -- longest whitespace prefix ending in CR/LF
+    lastnl := -1
+    scan := i
+    sc := cp
+    sw := w
+    for scan < runend {
+        if is_nl(sc) {
+            lastnl = scan + sw
+        }
+        scan = scan + sw
+        sc, sw = utf8_at(b, scan)
+    }
+    if lastnl > i-1 && lastnl > 0 {
+        end = lastnl
+        return end
+    }
+
+    // 6. \s+(?!\S)  -- whitespace not followed by a non-space
+    if runend >= n {
+        end = runend
+        return end
+    }
+    back := runend - 1
+    if back > i {
+        // trim one codepoint so the next position is still whitespace
+        prev := i
+        pc6 := cp
+        pw6 := w
+        cut := i
+        for prev < runend {
+            cut = prev
+            prev = prev + pw6
+            pc6, pw6 = utf8_at(b, prev)
+        }
+        if cut > i {
+            end = cut
+            return end
+        }
+    }
+
+    // 7. \s+
+    end = runend
+}

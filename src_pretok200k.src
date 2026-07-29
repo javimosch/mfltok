@@ -1,0 +1,235 @@
+// o200k_base pretokenizer (GPT-4o / o-series).
+//
+//   [^\r\n\p{L}\p{N}]?[\p{Lu}\p{Lt}\p{Lm}\p{Lo}\p{M}]*[\p{Ll}\p{Lm}\p{Lo}\p{M}]+(?i:'s|'t|'re|'ve|'m|'ll|'d)?
+//  |[^\r\n\p{L}\p{N}]?[\p{Lu}\p{Lt}\p{Lm}\p{Lo}\p{M}]+[\p{Ll}\p{Lm}\p{Lo}\p{M}]*(?i:'s|'t|'re|'ve|'m|'ll|'d)?
+//  |\p{N}{1,3}| ?[^\s\p{L}\p{N}]+[\r\n/]*|\s*[\r\n]+|\s+(?!\S)|\s+
+//
+// Unlike cl100k's, these quantifiers are NOT possessive, and the two letter
+// classes OVERLAP on {Lm, Lo, M}. So `U* L+` genuinely backtracks: U* takes as
+// much as it can, then gives characters back one at a time until L+ can match.
+// We emulate that explicitly -- greedy first, then walk the backtrack points in
+// the same order the engine would.
+
+func is_upperish(cp) (r) { r = uni_in(uni_upperish, cp) }
+func is_lowerish(cp) (r) { r = uni_in(uni_lowerish, cp) }
+
+// Optional (?i:'s|'t|'re|'ve|'m|'ll|'d) at p -- returns bytes consumed (0 if none).
+func contraction_len(b, p) (w) {
+    n := len(b)
+    w = 0
+    if p >= n {
+        return w
+    }
+    if byte_at(b, p) != 39 {
+        return w
+    }
+    if p+1 >= n {
+        return w
+    }
+    c1 := byte_at(b, p+1)
+    if c1 >= 65 && c1 <= 90 {
+        c1 = c1 + 32
+    }
+    if c1 == 115 || c1 == 116 || c1 == 109 || c1 == 100 {
+        w = 2
+        return w
+    }
+    if p+2 >= n {
+        return w
+    }
+    c2 := byte_at(b, p+2)
+    if c2 >= 65 && c2 <= 90 {
+        c2 = c2 + 32
+    }
+    if c1 == 114 && c2 == 101 { w = 3  return w }
+    if c1 == 118 && c2 == 101 { w = 3  return w }
+    if c1 == 108 && c2 == 108 { w = 3  return w }
+}
+
+// Collect the byte offsets of a maximal run of class `which` starting at p.
+// which: 1 = upperish, 2 = lowerish. Returns the boundary list (p first).
+func class_run(b, p, which) (stops) {
+    stops = []int{}
+    stops = append(stops, p)
+    n := len(b)
+    q := p
+    for q < n {
+        cp := 0
+        w := 0
+        cp, w = utf8_at(b, q)
+        okc := false
+        if which == 1 {
+            okc = is_upperish(cp)
+        } else {
+            okc = is_lowerish(cp)
+        }
+        if !okc {
+            return stops
+        }
+        q = q + w
+        stops = append(stops, q)
+    }
+}
+
+// Try alternative 1 or 2 at i. minUpper=0 for A1 (U*), 1 for A2 (U+);
+// minLower=1 for A1 (L+), 0 for A2 (L*). Returns -1 if no match.
+func try_letter_alt(b, i, minUpper, minLower) (end) {
+    n := len(b)
+    end = -1
+    if i >= n {
+        return end
+    }
+
+    // optional [^\r\n\p{L}\p{N}]? -- greedy: try WITH the prefix first.
+    cp0 := 0
+    w0 := 0
+    cp0, w0 = utf8_at(b, i)
+    starts := []int{}
+    if !is_nl(cp0) && !is_letter(cp0) && !is_number(cp0) {
+        starts = append(starts, i+w0)
+    }
+    starts = append(starts, i)
+
+    si := 0
+    for si < len(starts) {
+        p := starts[si]
+        ustops := class_run(b, p, 1)
+        // U quantifier: greedy, walk back toward the minimum
+        ui := len(ustops) - 1
+        for ui >= minUpper {
+            umid := ustops[ui]
+            lstops := class_run(b, umid, 2)
+            lcount := len(lstops) - 1
+            if lcount >= minLower {
+                lend := lstops[lcount]
+                end = lend + contraction_len(b, lend)
+                return end
+            }
+            ui = ui - 1
+        }
+        si = si + 1
+    }
+}
+
+func pretok200k_end(b, i) (end) {
+    n := len(b)
+    end = i
+    if i >= n {
+        return end
+    }
+
+    // 1.  [^\r\n\p{L}\p{N}]? U* L+ contraction?
+    a1 := try_letter_alt(b, i, 0, 1)
+    if a1 > i {
+        end = a1
+        return end
+    }
+    // 2.  [^\r\n\p{L}\p{N}]? U+ L* contraction?
+    a2 := try_letter_alt(b, i, 1, 0)
+    if a2 > i {
+        end = a2
+        return end
+    }
+
+    cp := 0
+    w := 0
+    cp, w = utf8_at(b, i)
+
+    // 3. \p{N}{1,3}
+    if is_number(cp) {
+        cnt := 0
+        q3 := i
+        c3 := cp
+        w3 := w
+        for q3 < n && is_number(c3) && cnt < 3 {
+            q3 = q3 + w3
+            cnt = cnt + 1
+            c3, w3 = utf8_at(b, q3)
+        }
+        end = q3
+        return end
+    }
+
+    // 4.  ?[^\s\p{L}\p{N}]+[\r\n/]*      (note: SLASH joins CR/LF here)
+    s4 := i
+    c4 := cp
+    w4 := w
+    if cp == 32 {
+        nc4 := 0
+        nw4 := 0
+        nc4, nw4 = utf8_at(b, i+1)
+        if i+1 < n && !is_space(nc4) && !is_letter(nc4) && !is_number(nc4) {
+            s4 = i + 1
+            c4 = nc4
+            w4 = nw4
+        }
+    }
+    if s4 < n && !is_space(c4) && !is_letter(c4) && !is_number(c4) {
+        q4 := s4
+        d4 := c4
+        v4 := w4
+        for q4 < n && !is_space(d4) && !is_letter(d4) && !is_number(d4) {
+            q4 = q4 + v4
+            d4, v4 = utf8_at(b, q4)
+        }
+        for q4 < n && (is_nl(d4) || d4 == 47) {
+            q4 = q4 + v4
+            d4, v4 = utf8_at(b, q4)
+        }
+        end = q4
+        return end
+    }
+
+    if !is_space(cp) {
+        end = i + w
+        return end
+    }
+
+    // whitespace run
+    runend := i
+    rc := cp
+    rw := w
+    for runend < n && is_space(rc) {
+        runend = runend + rw
+        rc, rw = utf8_at(b, runend)
+    }
+
+    // 5. \s*[\r\n]+   -- longest whitespace prefix ending in a run of CR/LF
+    lastnl := -1
+    scan := i
+    sc := cp
+    sw := w
+    for scan < runend {
+        if is_nl(sc) {
+            lastnl = scan + sw
+        }
+        scan = scan + sw
+        sc, sw = utf8_at(b, scan)
+    }
+    if lastnl > 0 {
+        end = lastnl
+        return end
+    }
+
+    // 6. \s+(?!\S)
+    if runend >= n {
+        end = runend
+        return end
+    }
+    prev := i
+    pw6 := w
+    cut := i
+    for prev < runend {
+        cut = prev
+        prev = prev + pw6
+        c6 := 0
+        c6, pw6 = utf8_at(b, prev)
+    }
+    if cut > i {
+        end = cut
+        return end
+    }
+
+    // 7. \s+
+    end = runend
+}

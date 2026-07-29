@@ -1,0 +1,130 @@
+// mfltok -- a real BPE tokenizer as a single static binary.
+//
+// Agent-first contract: stdout is JSON, stderr is errors, exit codes are
+// semantic (0 ok, 2 usage, 3 missing vocab, 4 conformance failure).
+
+// 0 = cl100k_base pattern, 1 = o200k_base pattern.
+var g_pat = 0
+
+func encode_text(b) (out) {
+    out = []int{}
+    n := len(b)
+    i := 0
+    for i < n {
+        e := 0
+        if g_pat == 1 {
+            e = pretok200k_end(b, i)
+        } else {
+            e = pretok_end(b, i)
+        }
+        if e <= i {
+            e = i + 1
+        }
+        ids := bpe_merge(bytes_sub(b, i, e))
+        k := 0
+        for k < len(ids) {
+            out = append(out, ids[k])
+            k = k + 1
+        }
+        i = e
+    }
+}
+
+func vocab_path(name) (p) {
+    base := env("MFLTOK_VOCAB_DIR")
+    if base == "" {
+        base = "vocab"
+    }
+    p = base + "/" + name + ".tiktoken"
+}
+
+func ints_json(xs) (s) {
+    parts := []string{}
+    i := 0
+    for i < len(xs) {
+        parts = append(parts, str(xs[i]))
+        i = i + 1
+    }
+    s = "[" + join(parts, ",") + "]"
+}
+
+func usage() {
+    println("mfltok -- BPE tokenizer (pure MFL)")
+    println("")
+    println("  mfltok count  [--vocab NAME] [FILE]   token count as JSON")
+    println("  mfltok encode [--vocab NAME] [FILE]   token ids as JSON")
+    println("  mfltok selftest FIXTURE [--vocab N]   check against expected ids")
+    println("")
+    println("FILE defaults to stdin. --vocab defaults to cl100k_base.")
+    println("Vocab dir: $MFLTOK_VOCAB_DIR (default ./vocab)")
+}
+
+func main() {
+    a := args()
+    if len(a) < 2 {
+        usage()
+        exit(2)
+    }
+    cmd := a[1]
+    if cmd == "help" || cmd == "--help" || cmd == "-h" {
+        usage()
+        exit(0)
+    }
+
+    vocab := "cl100k_base"
+    file := ""
+    i := 2
+    for i < len(a) {
+        if a[i] == "--vocab" && i+1 < len(a) {
+            vocab = a[i+1]
+            i = i + 2
+        } else {
+            file = a[i]
+            i = i + 1
+        }
+    }
+
+    if vocab == "o200k_base" {
+        g_pat = 1
+    }
+
+    vp := vocab_path(vocab)
+    t0 := now_ms()
+    loaded := bpe_load(vp)
+    if loaded == 0 {
+        println("error: no ranks loaded from " + vp)
+        exit(3)
+    }
+    load_ms := now_ms() - t0
+
+    if cmd == "selftest" {
+        if file == "" {
+            println("error: selftest needs a fixture path")
+            exit(2)
+        }
+        run_selftest(file, load_ms)
+        return
+    }
+
+    data := bytes("")
+    if file == "" {
+        data = bytes(read_stdin())
+    } else {
+        data = read_file_bytes(file)
+    }
+
+    t1 := now_ms()
+    ids := encode_text(data)
+    enc_ms := now_ms() - t1
+
+    if cmd == "count" {
+        println("{\"vocab\":\"" + vocab + "\",\"bytes\":" + str(len(data)) + ",\"tokens\":" + str(len(ids)) + ",\"load_ms\":" + str(load_ms) + ",\"encode_ms\":" + str(enc_ms) + "}")
+        return
+    }
+    if cmd == "encode" {
+        println("{\"vocab\":\"" + vocab + "\",\"tokens\":" + str(len(ids)) + ",\"ids\":" + ints_json(ids) + "}")
+        return
+    }
+    println("error: unknown command " + cmd)
+    exit(2)
+}

@@ -1,0 +1,195 @@
+// Byte-pair-encoding core: rank table loading + the merge loop.
+//
+// Ranks are keyed by LOWERCASE HEX of the token's raw bytes, not by the bytes
+// themselves. Both cl100k_base and o200k_base contain tokens with an embedded
+// NUL (1 and 2 respectively); MFL strings are NUL-terminated, so a raw-bytes
+// key would silently collide/truncate. Hex is NUL-safe and order-preserving.
+
+var RANK_MAX = 2147483647
+
+var g_ranks = make(map[string]int)
+var g_rank_count = 0
+
+// Load a .tiktoken file: each line is "<base64-token> <rank>".
+func bpe_load(path) (n) {
+    n = 0
+    raw := read_file_bytes(path)
+    total := len(raw)
+    if total == 0 {
+        return n
+    }
+    nl := bytes("\n")
+    sp := bytes(" ")
+    pos := 0
+    for pos < total {
+        e := bytes_index(raw, nl, pos)
+        if e < 0 {
+            e = total
+        }
+        if e > pos {
+            cut := bytes_index(raw, sp, pos)
+            if cut > pos && cut < e {
+                b64 := bytes_str(bytes_sub(raw, pos, cut))
+                rankstr := bytes_str(bytes_sub(raw, cut+1, e))
+                tok := base64_decode_bytes(b64)
+                g_ranks[to_hex(tok)] = parse_int(rankstr)
+                n = n + 1
+            }
+        }
+        pos = e + 1
+    }
+    g_rank_count = n
+    bpe_build_cache()
+}
+
+// Direct-index caches for the two piece sizes that dominate the merge loop:
+// every initial pair probe is 2 bytes and every final emit is often 1. Filling
+// these once at load turns those probes into an array index instead of a
+// to_hex() allocation + string hash. Longer pieces still go through the map.
+var g_r1 = []int{}
+var g_r2 = []int{}
+
+func hex2(v) (s) {
+    d := "0123456789abcdef"
+    s = substr(d, v/16, v/16+1) + substr(d, v%16, v%16+1)
+}
+
+func bpe_build_cache() {
+    g_r1 = []int{}
+    a := 0
+    for a < 256 {
+        ka := hex2(a)
+        v1 := -1
+        if has(g_ranks, ka) {
+            v1 = g_ranks[ka]
+        }
+        g_r1 = append(g_r1, v1)
+        a = a + 1
+    }
+    g_r2 = []int{}
+    x := 0
+    for x < 256 {
+        kx := hex2(x)
+        y := 0
+        for y < 256 {
+            k2 := kx + hex2(y)
+            v2 := -1
+            if has(g_ranks, k2) {
+                v2 = g_ranks[k2]
+            }
+            g_r2 = append(g_r2, v2)
+            y = y + 1
+        }
+        x = x + 1
+    }
+}
+
+// Rank of a byte sequence, or -1 when absent.
+func bpe_rank(b) (r) {
+    n := len(b)
+    if n == 1 {
+        r = g_r1[byte_at(b, 0)]
+        return r
+    }
+    if n == 2 {
+        r = g_r2[byte_at(b, 0)*256+byte_at(b, 1)]
+        return r
+    }
+    k := to_hex(b)
+    r = -1
+    if has(g_ranks, k) {
+        r = g_ranks[k]
+    }
+}
+
+// tiktoken's _byte_pair_merge, on one pretoken.
+//
+// `starts[k]` is the byte offset of part k; `ranks[k]` is the rank of the pair
+// (part k + part k+1), or RANK_MAX when that pair is not a token. After each
+// merge only TWO neighbouring ranks can change, so we patch them instead of
+// rescanning -- the difference between O(n^2) and O(n) rank lookups per merge,
+// and rank lookups are the hot path (a hex key per probe).
+func bpe_merge(piece) (out) {
+    out = []int{}
+    plen := len(piece)
+    if plen == 0 {
+        return out
+    }
+    if plen == 1 {
+        out = append(out, bpe_rank(piece))
+        return out
+    }
+
+    starts := []int{}
+    ranks := []int{}
+    i := 0
+    for i <= plen {
+        starts = append(starts, i)
+        r := RANK_MAX
+        if i+2 <= plen {
+            got := bpe_rank(bytes_sub(piece, i, i+2))
+            if got >= 0 {
+                r = got
+            }
+        }
+        ranks = append(ranks, r)
+        i = i + 1
+    }
+
+    for true {
+        nparts := len(starts)
+        if nparts <= 2 {
+            break
+        }
+        best := RANK_MAX
+        besti := -1
+        j := 0
+        for j < nparts-2 {
+            if ranks[j] < best {
+                best = ranks[j]
+                besti = j
+            }
+            j = j + 1
+        }
+        if besti < 0 {
+            break
+        }
+
+        // merge parts besti and besti+1 -> repair ranks at besti and besti-1
+        ranks[besti] = RANK_MAX
+        if besti+3 < nparts {
+            got2 := bpe_rank(bytes_sub(piece, starts[besti], starts[besti+3]))
+            if got2 >= 0 {
+                ranks[besti] = got2
+            }
+        }
+        if besti > 0 {
+            ranks[besti-1] = RANK_MAX
+            if besti+2 < nparts {
+                got3 := bpe_rank(bytes_sub(piece, starts[besti-1], starts[besti+2]))
+                if got3 >= 0 {
+                    ranks[besti-1] = got3
+                }
+            }
+        }
+
+        ns := []int{}
+        nr := []int{}
+        k := 0
+        for k < nparts {
+            if k != besti+1 {
+                ns = append(ns, starts[k])
+                nr = append(nr, ranks[k])
+            }
+            k = k + 1
+        }
+        starts = ns
+        ranks = nr
+    }
+
+    m := 0
+    for m < len(starts)-1 {
+        out = append(out, bpe_rank(bytes_sub(piece, starts[m], starts[m+1])))
+        m = m + 1
+    }
+}
