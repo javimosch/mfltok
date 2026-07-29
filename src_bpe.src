@@ -86,16 +86,30 @@ func bpe_build_cache() {
 
 // Rank of a byte sequence, or -1 when absent.
 func bpe_rank(b) (r) {
-    n := len(b)
+    r = bpe_rank_range(b, 0, len(b))
+}
+
+// Rank of piece[lo:hi] WITHOUT materialising the slice.
+//
+// The merge loop probes ranges of one pretoken thousands of times per file.
+// Going through bytes_sub + to_hex allocated two values per probe, which
+// dominated peak RSS (transient encode garbage, not the rank table). Here the
+// 1- and 2-byte cases index a table straight off byte_at, and longer pieces
+// build the hex key directly from the source bytes -- one allocation, not two.
+func bpe_rank_range(b, lo, hi) (r) {
+    n := hi - lo
     if n == 1 {
-        r = g_r1[byte_at(b, 0)]
+        r = g_r1[byte_at(b, lo)]
         return r
     }
     if n == 2 {
-        r = g_r2[byte_at(b, 0)*256+byte_at(b, 1)]
+        r = g_r2[byte_at(b, lo)*256+byte_at(b, lo+1)]
         return r
     }
-    k := to_hex(b)
+    // Longer pieces: to_hex over a sub-slice. Building the key byte-by-byte in
+    // MFL was measured WORSE (a []string + append + join is N allocations per
+    // probe against these two), so the C builtins win here.
+    k := to_hex(bytes_sub(b, lo, hi))
     r = -1
     if has(g_ranks, k) {
         r = g_ranks[k]
@@ -127,7 +141,7 @@ func bpe_merge(piece) (out) {
         starts = append(starts, i)
         r := RANK_MAX
         if i+2 <= plen {
-            got := bpe_rank(bytes_sub(piece, i, i+2))
+            got := bpe_rank_range(piece, i, i+2)
             if got >= 0 {
                 r = got
             }
@@ -136,8 +150,12 @@ func bpe_merge(piece) (out) {
         i = i + 1
     }
 
+    // `cnt` is the live prefix length of starts/ranks. MFL has no slice
+    // expressions, and rebuilding the slices per merge allocated O(merges)
+    // garbage, so the arrays are compacted in place and only cnt shrinks.
+    cnt := len(starts)
     for true {
-        nparts := len(starts)
+        nparts := cnt
         if nparts <= 2 {
             break
         }
@@ -158,7 +176,7 @@ func bpe_merge(piece) (out) {
         // merge parts besti and besti+1 -> repair ranks at besti and besti-1
         ranks[besti] = RANK_MAX
         if besti+3 < nparts {
-            got2 := bpe_rank(bytes_sub(piece, starts[besti], starts[besti+3]))
+            got2 := bpe_rank_range(piece, starts[besti], starts[besti+3])
             if got2 >= 0 {
                 ranks[besti] = got2
             }
@@ -166,30 +184,27 @@ func bpe_merge(piece) (out) {
         if besti > 0 {
             ranks[besti-1] = RANK_MAX
             if besti+2 < nparts {
-                got3 := bpe_rank(bytes_sub(piece, starts[besti-1], starts[besti+2]))
+                got3 := bpe_rank_range(piece, starts[besti-1], starts[besti+2])
                 if got3 >= 0 {
                     ranks[besti-1] = got3
                 }
             }
         }
 
-        ns := []int{}
-        nr := []int{}
-        k := 0
-        for k < nparts {
-            if k != besti+1 {
-                ns = append(ns, starts[k])
-                nr = append(nr, ranks[k])
-            }
+        // shift left over the dropped boundary, in place: rebuilding two
+        // slices per merge allocated O(merges) garbage for no reason.
+        k := besti + 1
+        for k < nparts-1 {
+            starts[k] = starts[k+1]
+            ranks[k] = ranks[k+1]
             k = k + 1
         }
-        starts = ns
-        ranks = nr
+        cnt = nparts - 1
     }
 
     m := 0
-    for m < len(starts)-1 {
-        out = append(out, bpe_rank(bytes_sub(piece, starts[m], starts[m+1])))
+    for m < cnt-1 {
+        out = append(out, bpe_rank_range(piece, starts[m], starts[m+1]))
         m = m + 1
     }
 }

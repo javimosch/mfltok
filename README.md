@@ -120,15 +120,33 @@ Three problems, none of which have a library in MFL:
 
 | | wall clock (process start → answer) | encode only | peak RSS |
 |---|---:|---:|---:|
-| **mfltok** (static binary) | **0.21 s** | 134 ms | 155 MB |
-| Python + `tiktoken` (Rust core) | 0.32 s | 101 ms | 68 MB |
+| **mfltok** (static binary) | **0.15 s** | **72 ms** | 105 MB |
+| Python + `tiktoken` (Rust core) | 0.26 s | 87 ms | 68 MB |
 
-Honest reading: tiktoken's Rust core **out-encodes this by ~1.3×**. mfltok wins
-end-to-end only because it has no interpreter to boot — which is the metric that
-matters when a CI job or an agent shells out per file, and not otherwise. The
-155 MB RSS is the hex-keyed rank map; that is the obvious thing to fix next
-(intern keys, or index by a packed integer). It is not competitive on memory.
+Pure MFL edges out tiktoken's Rust core on encode (~1.2×) and wins end-to-end
+by ~1.7× because there is no interpreter to boot. Two changes got it there, and
+the second only because the first measurement was wrong:
+
+- **Range probes instead of sub-slices.** The merge loop probes ranges of one
+  pretoken thousands of times per file. Routing 1- and 2-byte probes straight
+  off `byte_at` into a direct-index table removes a `bytes_sub` **and** a
+  `to_hex` allocation from the hottest path. In-place compaction of the
+  boundary arrays removes another O(merges) of garbage.
+- **What did *not* work:** building the hex key byte-by-byte in MFL to avoid
+  `bytes_sub` entirely. A `[]string` + `append` + `join` is N allocations per
+  probe against the two it replaced — measured *worse* on both axes (202 MB,
+  190 ms). The C builtins win for pieces ≥ 3 bytes. It is in the source as a
+  comment so nobody re-tries it.
+
+**On memory, and a correction.** An earlier version of this file blamed the
+then-155 MB peak on the hex-keyed rank map. That was wrong, and measuring
+instead of asserting is the whole point of this repo, so: loading the ranks
+alone costs **47 MB** (cl100k) / **85 MB** (o200k). The rest was transient
+encode garbage, which is what the changes above removed. It is still above
+tiktoken's 68 MB, and the rank map — one interned hex string per token — is the
+honest next target.
 
 ## Licence
 
 MIT.
+
