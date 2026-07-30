@@ -80,6 +80,15 @@ $ mfltok scan . --vocab o200k_base
 **Every exclusion is counted.** A scanner that silently drops files reads as
 "I measured everything" when it did not.
 
+**It honours `.gitignore`** (nested files included) and `.git/info/exclude`. If
+the repo says a file is not source, it is not priced. On this repo that gives
+exactly the 19 files `git ls-files` reports. Two honest limits: the pattern
+support is a subset (no `**`, no `[a-z]` classes, no escapes — unsupported
+patterns are *counted and reported*, never silently ignored), and a global
+`core.excludesFile` is not read, since that needs git config. On a 3,000-file
+repo mfltok scanned 490 files where a git-based oracle suggested ~469; that ~4 %
+is not fully attributed and is stated here rather than rounded away.
+
 `scan` **supersedes [token-optimizer-cli](https://github.com/javimosch/token-optimizer-cli)**,
 which is now deprecated: its `scan`/`audit`/`summary` were three printers over
 one identical computation, and `check` is `mfltok count`. That repo is kept
@@ -168,31 +177,39 @@ Three problems, none of which have a library in MFL:
 
 | | wall clock (process start → answer) | encode only | peak RSS |
 |---|---:|---:|---:|
-| **mfltok** (static binary) | **0.15 s** | **72 ms** | 105 MB |
-| Python + `tiktoken` (Rust core) | 0.26 s | 87 ms | 68 MB |
+| **mfltok** (static binary) | **0.08 s** | **57 ms** | **56 MB** |
+| Python + `tiktoken` (Rust core) | 0.37 s | 87 ms | 68 MB |
 
-Pure MFL edges out tiktoken's Rust core on encode (~1.2×) and wins end-to-end
-by ~1.7× because there is no interpreter to boot. Two changes got it there, and
-the second only because the first measurement was wrong:
+Pure MFL now wins on all three axes against tiktoken's Rust core. Getting there
+took two rewrites, and the second only happened because the first measurement
+was wrong.
 
-- **Range probes instead of sub-slices.** The merge loop probes ranges of one
-  pretoken thousands of times per file. Routing 1- and 2-byte probes straight
-  off `byte_at` into a direct-index table removes a `bytes_sub` **and** a
-  `to_hex` allocation from the hottest path. In-place compaction of the
-  boundary arrays removes another O(merges) of garbage.
-- **What did *not* work:** building the hex key byte-by-byte in MFL to avoid
-  `bytes_sub` entirely. A `[]string` + `append` + `join` is N allocations per
-  probe against the two it replaced — measured *worse* on both axes (202 MB,
-  190 ms). The C builtins win for pieces ≥ 3 bytes. It is in the source as a
-  comment so nobody re-tries it.
+**The rank table is not a hash map.** Keying a `map[string]int` by each token's
+hex cost ~470 bytes per entry — 47 MB for cl100k, 85 MB for o200k, before
+encoding a single byte. It is now a flat open-addressing table: decoded tokens
+live in one `alloc()`'d blob, three int arrays hold (offset, length, rank), and
+lookup hashes the bytes in place and compares against the blob with `peek_i8`.
+Nothing is allocated per probe. NUL-safety comes free — a length-delimited blob
+has no terminator to trip over, so the hex encoding that existed purely to dodge
+embedded NULs disappeared with it.
 
-**On memory, and a correction.** An earlier version of this file blamed the
-then-155 MB peak on the hex-keyed rank map. That was wrong, and measuring
-instead of asserting is the whole point of this repo, so: loading the ranks
-alone costs **47 MB** (cl100k) / **85 MB** (o200k). The rest was transient
-encode garbage, which is what the changes above removed. It is still above
-tiktoken's 68 MB, and the rank map — one interned hex string per token — is the
-honest next target.
+**Loading allocates nothing either.** The bigger surprise: most of the resident
+memory was not the table, it was *load*. Each line did `bytes_sub` ×2 +
+`bytes_str` ×2 + `base64_decode_bytes` — five arena allocations × 200,000 lines,
+none reclaimable until the process exits. Decoding base64 straight out of the
+mapped file into the blob removed all of it: **85 MB → 27 MB** to load o200k,
+and load time fell from 71 ms to 20 ms.
+
+**What did not work**, recorded so it is not retried: building the lookup key
+byte-by-byte in MFL to avoid `bytes_sub`. A `[]string` + `append` + `join` is N
+allocations per probe against the two it replaced — measured *worse* on both
+axes (202 MB, 190 ms).
+
+An earlier version of this file blamed the then-155 MB peak on the rank map
+without measuring it. That was wrong twice over: the map was 47 MB of it, and
+the real culprit was transient garbage. Measuring instead of asserting is the
+whole point of this repo, so the wrong claim is recorded rather than quietly
+replaced.
 
 ## Licence
 

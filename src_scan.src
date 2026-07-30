@@ -17,6 +17,8 @@ var sc_skip_binary = 0
 var sc_skip_large = 0
 var sc_skip_link = 0
 var sc_skip_dot = 0
+var sc_skip_ignored = 0
+var sc_root = ""
 
 var SC_MAX_BYTES = 10485760
 
@@ -42,7 +44,7 @@ func sc_ext(path) (e) {
 }
 
 func sc_binary(ext) (yes) {
-    yes = ext == ".png" || ext == ".jpg" || ext == ".jpeg" || ext == ".gif" || ext == ".ico" || ext == ".svg" || ext == ".woff" || ext == ".woff2" || ext == ".ttf" || ext == ".eot" || ext == ".pdf" || ext == ".zip" || ext == ".tar" || ext == ".gz" || ext == ".bz2" || ext == ".7z" || ext == ".exe" || ext == ".bin" || ext == ".dll" || ext == ".so" || ext == ".dylib" || ext == ".o" || ext == ".a" || ext == ".class" || ext == ".pyc" || ext == ".pyo" || ext == ".mp3" || ext == ".mp4" || ext == ".mov" || ext == ".avi" || ext == ".webm" || ext == ".tiktoken" || ext == ".fixture"
+    yes = ext == ".png" || ext == ".jpg" || ext == ".jpeg" || ext == ".gif" || ext == ".ico" || ext == ".svg" || ext == ".woff" || ext == ".woff2" || ext == ".ttf" || ext == ".eot" || ext == ".pdf" || ext == ".zip" || ext == ".tar" || ext == ".gz" || ext == ".bz2" || ext == ".7z" || ext == ".exe" || ext == ".bin" || ext == ".dll" || ext == ".so" || ext == ".dylib" || ext == ".o" || ext == ".a" || ext == ".class" || ext == ".pyc" || ext == ".pyo" || ext == ".mp3" || ext == ".mp4" || ext == ".mov" || ext == ".avi" || ext == ".webm"
 }
 
 var sc_lang = make(map[string]string)
@@ -87,9 +89,34 @@ func sc_language(path) (l) {
 // Recursive walk. `depth` bounds pathological trees; symlinks are never
 // followed, which is what makes this terminate (a link back up the tree would
 // otherwise loop forever -- is_dir() alone cannot tell you, since stat follows).
+func sc_rel(path) (r) {
+    r = path
+    if path == sc_root {
+        r = ""
+        return r
+    }
+    if len(sc_root) > 0 && len(path) > len(sc_root) {
+        if substr(path, 0, len(sc_root)) == sc_root {
+            r = substr(path, len(sc_root), len(path))
+            if len(r) > 0 && substr(r, 0, 1) == "/" {
+                r = substr(r, 1, len(r))
+            }
+        }
+    }
+}
+
 func sc_walk(dir, depth) {
     if depth > 64 {
         return
+    }
+    // a nested .gitignore governs its own subtree
+    gp := dir + "/.gitignore"
+    if file_size(gp) > 0 {
+        rb := sc_rel(dir)
+        if rb != "" {
+            rb = rb + "/"
+        }
+        gi_load(gp, rb)
     }
     entries := list_dir(dir)
     i := 0
@@ -107,7 +134,11 @@ func sc_walk(dir, depth) {
                 if sc_skipdir(name) || substr(name, 0, 1) == "." {
                     sc_skip_dir = sc_skip_dir + 1
                 } else {
+                if gi_ignored(sc_rel(path), true) {
+                    sc_skip_ignored = sc_skip_ignored + 1
+                } else {
                     sc_walk(path, depth+1)
+                }
                 }
             } else {
                 sc_file(path, name)
@@ -120,6 +151,10 @@ func sc_walk(dir, depth) {
 func sc_file(path, name) {
     if substr(name, 0, 1) == "." {
         sc_skip_dot = sc_skip_dot + 1
+        return
+    }
+    if gi_ignored(sc_rel(path), false) {
+        sc_skip_ignored = sc_skip_ignored + 1
         return
     }
     ext := sc_ext(path)
@@ -228,7 +263,10 @@ func sc_human(root, total, bloat_files, bloat_tokens, small, med, large, xl, gen
     println("  >5000            " + str(xl))
     println("")
     println("Excluded (counted, never silent):")
-    println("  vendor dirs " + str(sc_skip_dir) + "   binary " + str(sc_skip_binary) + "   >10MB " + str(sc_skip_large) + "   symlinks " + str(sc_skip_link) + "   dotfiles " + str(sc_skip_dot))
+    println("  vendor dirs " + str(sc_skip_dir) + "   binary " + str(sc_skip_binary) + "   >10MB " + str(sc_skip_large) + "   symlinks " + str(sc_skip_link) + "   dotfiles " + str(sc_skip_dot) + "   gitignored " + str(sc_skip_ignored))
+    if gi_unsupported > 0 {
+        println("  " + str(gi_unsupported) + " .gitignore pattern(s) used syntax this does not implement (** [] \\) and were skipped")
+    }
     println("")
     println("Heaviest files:")
     k := 0
@@ -280,6 +318,12 @@ func sc_order(n) (idx) {
 
 func run_scan(root, vocab, load_ms, human) {
     sc_lang_init()
+    gi_reset()
+    sc_root = root
+    // git also consults .git/info/exclude. It does NOT stop there -- a global
+    // core.excludesFile is honoured too, and reading that needs git config, so
+    // it is a known gap: mfltok may include a few files your git excludes.
+    gi_load(root + "/.git/info/exclude", "")
     t0 := now_ms()
     if !is_dir(root) {
         println("error: not a directory: " + root)
@@ -321,7 +365,7 @@ func run_scan(root, vocab, load_ms, human) {
         return
     }
 
-    skipped := "{\"vendor_dirs\":" + str(sc_skip_dir) + ",\"binary\":" + str(sc_skip_binary) + ",\"over_10mb\":" + str(sc_skip_large) + ",\"symlinks\":" + str(sc_skip_link) + ",\"dotfiles\":" + str(sc_skip_dot) + "}"
+    skipped := "{\"vendor_dirs\":" + str(sc_skip_dir) + ",\"binary\":" + str(sc_skip_binary) + ",\"over_10mb\":" + str(sc_skip_large) + ",\"symlinks\":" + str(sc_skip_link) + ",\"dotfiles\":" + str(sc_skip_dot) + ",\"gitignored\":" + str(sc_skip_ignored) + ",\"gitignore_patterns_unsupported\":" + str(gi_unsupported) + "}"
     dist := "{\"small\":" + str(small) + ",\"medium\":" + str(med) + ",\"large\":" + str(large) + ",\"xl\":" + str(xl) + "}"
     generated := "{\"files\":" + str(gen_files) + ",\"tokens\":" + str(gen_tokens) + "}"
 

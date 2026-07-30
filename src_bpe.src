@@ -1,14 +1,109 @@
 // Byte-pair-encoding core: rank table loading + the merge loop.
 //
-// Ranks are keyed by LOWERCASE HEX of the token's raw bytes, not by the bytes
-// themselves. Both cl100k_base and o200k_base contain tokens with an embedded
-// NUL (1 and 2 respectively); MFL strings are NUL-terminated, so a raw-bytes
-// key would silently collide/truncate. Hex is NUL-safe and order-preserving.
+// The rank table is a flat open-addressing hash table over raw memory, NOT a
+// map[string]int. The first version keyed a map by the lowercase hex of each
+// token (hex because both vocabularies contain tokens with an embedded NUL, and
+// MFL strings are NUL-terminated, so a raw-bytes key silently truncates). That
+// was correct but cost ~470 bytes per entry -- 47 MB for cl100k, 85 MB for
+// o200k, before encoding a single byte.
+//
+// Here the decoded token bytes live in one alloc()'d blob, three int arrays
+// hold (offset, length, rank), and an open-addressed slot table indexes them.
+// Nothing is allocated per probe: lookup hashes the bytes in place and compares
+// against the blob with peek_i8. NUL-safety comes free -- a length-delimited
+// blob has no terminator to trip over.
 
 var RANK_MAX = 2147483647
 
-var g_ranks = make(map[string]int)
+var g_blob = 0
+var g_off = []int{}
+var g_len = []int{}
+var g_rank = []int{}
+var g_slot = []int{}
+var g_mask = 0
 var g_rank_count = 0
+
+// FNV-1a, folded to 31 bits so it stays positive and cannot overflow int64
+// when multiplied (h < 2^31, prime < 2^24, product < 2^55).
+func hash_range(b, lo, hi) (h) {
+    h = 2166136261
+    i := lo
+    for i < hi {
+        h = ((h ^ byte_at(b, i)) * 16777619) % 2147483647
+        i = i + 1
+    }
+}
+
+func blob_u8(off) (v) {
+    v = peek_i8(g_blob, off)
+    if v < 0 {
+        v = v + 256
+    }
+}
+
+func hash_blob(off, ln) (h) {
+    h = 2166136261
+    i := 0
+    for i < ln {
+        h = ((h ^ blob_u8(off+i)) * 16777619) % 2147483647
+        i = i + 1
+    }
+}
+
+// base64 value of one ASCII char, or -1. The load path decodes straight out of
+// the mapped file into the blob, so it never allocates: the previous version
+// did bytes_sub + bytes_str + base64_decode_bytes per line -- five arena
+// allocations x 200k lines, none reclaimable until the process exits, which is
+// where most of the resident memory actually went.
+func b64val(c) (v) {
+    v = -1
+    if c >= 65 && c <= 90 { v = c - 65  return v }
+    if c >= 97 && c <= 122 { v = c - 71  return v }
+    if c >= 48 && c <= 57 { v = c + 4  return v }
+    if c == 43 { v = 62  return v }
+    if c == 47 { v = 63  return v }
+}
+
+// Decode raw[lo:hi] (base64) into g_blob at dst. Returns bytes written.
+func b64_into(raw, lo, hi, dst) (n) {
+    n = 0
+    acc := 0
+    bits := 0
+    i := lo
+    for i < hi {
+        v := b64val(byte_at(raw, i))
+        if v >= 0 {
+            acc = acc*64 + v
+            bits = bits + 6
+            if bits >= 8 {
+                bits = bits - 8
+                shift := 1
+                k := 0
+                for k < bits {
+                    shift = shift * 2
+                    k = k + 1
+                }
+                poke_u8(g_blob, dst+n, (acc/shift)%256)
+                n = n + 1
+                acc = acc % shift
+            }
+        }
+        i = i + 1
+    }
+}
+
+// Parse a non-negative integer out of raw[lo:hi] without allocating.
+func int_at(raw, lo, hi) (v) {
+    v = 0
+    i := lo
+    for i < hi {
+        c := byte_at(raw, i)
+        if c >= 48 && c <= 57 {
+            v = v*10 + (c - 48)
+        }
+        i = i + 1
+    }
+}
 
 // Load a .tiktoken file: each line is "<base64-token> <rank>".
 func bpe_load(path) (n) {
@@ -18,9 +113,18 @@ func bpe_load(path) (n) {
     if total == 0 {
         return n
     }
+
+    // base64 expands 3 bytes to 4, so the decoded corpus can never exceed the
+    // file length -- one allocation, no growth, no second pass to size it.
+    g_blob = alloc(total)
+    g_off = []int{}
+    g_len = []int{}
+    g_rank = []int{}
+
     nl := bytes("\n")
     sp := bytes(" ")
     pos := 0
+    wr := 0
     for pos < total {
         e := bytes_index(raw, nl, pos)
         if e < 0 {
@@ -29,58 +133,70 @@ func bpe_load(path) (n) {
         if e > pos {
             cut := bytes_index(raw, sp, pos)
             if cut > pos && cut < e {
-                b64 := bytes_str(bytes_sub(raw, pos, cut))
-                rankstr := bytes_str(bytes_sub(raw, cut+1, e))
-                tok := base64_decode_bytes(b64)
-                g_ranks[to_hex(tok)] = parse_int(rankstr)
+                tl := b64_into(raw, pos, cut, wr)
+                g_off = append(g_off, wr)
+                g_len = append(g_len, tl)
+                g_rank = append(g_rank, int_at(raw, cut+1, e))
+                wr = wr + tl
                 n = n + 1
             }
         }
         pos = e + 1
     }
     g_rank_count = n
+
+    // slot table: next power of two >= 2n, so load factor stays under 0.5
+    cap := 1024
+    for cap < n*2 {
+        cap = cap * 2
+    }
+    g_mask = cap - 1
+    g_slot = []int{}
+    s := 0
+    for s < cap {
+        g_slot = append(g_slot, 0)
+        s = s + 1
+    }
+    i := 0
+    for i < n {
+        idx := hash_blob(g_off[i], g_len[i]) & g_mask
+        for g_slot[idx] != 0 {
+            idx = (idx + 1) & g_mask
+        }
+        g_slot[idx] = i + 1
+        i = i + 1
+    }
+
     bpe_build_cache()
 }
 
 // Direct-index caches for the two piece sizes that dominate the merge loop:
-// every initial pair probe is 2 bytes and every final emit is often 1. Filling
-// these once at load turns those probes into an array index instead of a
-// to_hex() allocation + string hash. Longer pieces still go through the map.
+// every initial pair probe is 2 bytes and every final emit is often 1.
 var g_r1 = []int{}
 var g_r2 = []int{}
-
-func hex2(v) (s) {
-    d := "0123456789abcdef"
-    s = substr(d, v/16, v/16+1) + substr(d, v%16, v%16+1)
-}
 
 func bpe_build_cache() {
     g_r1 = []int{}
     a := 0
     for a < 256 {
-        ka := hex2(a)
-        v1 := -1
-        if has(g_ranks, ka) {
-            v1 = g_ranks[ka]
-        }
-        g_r1 = append(g_r1, v1)
+        g_r1 = append(g_r1, -1)
         a = a + 1
     }
     g_r2 = []int{}
     x := 0
-    for x < 256 {
-        kx := hex2(x)
-        y := 0
-        for y < 256 {
-            k2 := kx + hex2(y)
-            v2 := -1
-            if has(g_ranks, k2) {
-                v2 = g_ranks[k2]
-            }
-            g_r2 = append(g_r2, v2)
-            y = y + 1
-        }
+    for x < 65536 {
+        g_r2 = append(g_r2, -1)
         x = x + 1
+    }
+    i := 0
+    for i < g_rank_count {
+        if g_len[i] == 1 {
+            g_r1[blob_u8(g_off[i])] = g_rank[i]
+        }
+        if g_len[i] == 2 {
+            g_r2[blob_u8(g_off[i])*256+blob_u8(g_off[i]+1)] = g_rank[i]
+        }
+        i = i + 1
     }
 }
 
@@ -89,13 +205,7 @@ func bpe_rank(b) (r) {
     r = bpe_rank_range(b, 0, len(b))
 }
 
-// Rank of piece[lo:hi] WITHOUT materialising the slice.
-//
-// The merge loop probes ranges of one pretoken thousands of times per file.
-// Going through bytes_sub + to_hex allocated two values per probe, which
-// dominated peak RSS (transient encode garbage, not the rank table). Here the
-// 1- and 2-byte cases index a table straight off byte_at, and longer pieces
-// build the hex key directly from the source bytes -- one allocation, not two.
+// Rank of piece[lo:hi] WITHOUT materialising the slice or any key.
 func bpe_rank_range(b, lo, hi) (r) {
     n := hi - lo
     if n == 1 {
@@ -106,13 +216,32 @@ func bpe_rank_range(b, lo, hi) (r) {
         r = g_r2[byte_at(b, lo)*256+byte_at(b, lo+1)]
         return r
     }
-    // Longer pieces: to_hex over a sub-slice. Building the key byte-by-byte in
-    // MFL was measured WORSE (a []string + append + join is N allocations per
-    // probe against these two), so the C builtins win here.
-    k := to_hex(bytes_sub(b, lo, hi))
     r = -1
-    if has(g_ranks, k) {
-        r = g_ranks[k]
+    idx := hash_range(b, lo, hi) & g_mask
+    for true {
+        s := g_slot[idx]
+        if s == 0 {
+            return r
+        }
+        j := s - 1
+        if g_len[j] == n {
+            off := g_off[j]
+            same := true
+            k := 0
+            for k < n {
+                if blob_u8(off+k) != byte_at(b, lo+k) {
+                    same = false
+                    k = n
+                } else {
+                    k = k + 1
+                }
+            }
+            if same {
+                r = g_rank[j]
+                return r
+            }
+        }
+        idx = (idx + 1) & g_mask
     }
 }
 
@@ -121,8 +250,7 @@ func bpe_rank_range(b, lo, hi) (r) {
 // `starts[k]` is the byte offset of part k; `ranks[k]` is the rank of the pair
 // (part k + part k+1), or RANK_MAX when that pair is not a token. After each
 // merge only TWO neighbouring ranks can change, so we patch them instead of
-// rescanning -- the difference between O(n^2) and O(n) rank lookups per merge,
-// and rank lookups are the hot path (a hex key per probe).
+// rescanning.
 func bpe_merge(piece) (out) {
     out = []int{}
     plen := len(piece)
@@ -173,7 +301,6 @@ func bpe_merge(piece) (out) {
             break
         }
 
-        // merge parts besti and besti+1 -> repair ranks at besti and besti-1
         ranks[besti] = RANK_MAX
         if besti+3 < nparts {
             got2 := bpe_rank_range(piece, starts[besti], starts[besti+3])
@@ -191,8 +318,6 @@ func bpe_merge(piece) (out) {
             }
         }
 
-        // shift left over the dropped boundary, in place: rebuilding two
-        // slices per merge allocated O(merges) garbage for no reason.
         k := besti + 1
         for k < nparts-1 {
             starts[k] = starts[k+1]

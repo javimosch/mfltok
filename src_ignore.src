@@ -1,0 +1,188 @@
+// .gitignore awareness.
+//
+// The scan used to carry `.tiktoken` and `.fixture` in its binary-extension
+// list, which is repo-specific hardcoding -- the same sin this project
+// criticised in the Go scanner's skipFiles list, which named its own binary.
+// Both files are gitignored here, so the general rule subsumes the special
+// case: if the repo says a file is not part of the source, do not price it.
+//
+// Deliberately a SUBSET of gitignore semantics -- the common 95%:
+//   - blank lines and # comments
+//   - trailing / (directory-only)
+//   - leading / (anchored to the .gitignore's own directory)
+//   - a leading ! (negation) -- honoured, last match wins
+//   - * and ? wildcards within a path segment
+//   - a pattern with no / matches a basename at any depth
+// NOT supported: ** across segments, [a-z] classes, or escapes. Unsupported
+// patterns are COUNTED and reported so the gap is visible rather than silent.
+
+var gi_pat = []string{}
+var gi_neg = []int{}
+var gi_dironly = []int{}
+var gi_anchored = []int{}
+var gi_base = []string{}
+var gi_unsupported = 0
+
+func gi_reset() {
+    gi_pat = []string{}
+    gi_neg = []int{}
+    gi_dironly = []int{}
+    gi_anchored = []int{}
+    gi_base = []string{}
+    gi_unsupported = 0
+}
+
+func gi_trim(s) (out) {
+    lo := 0
+    hi := len(s)
+    for lo < hi && (substr(s, lo, lo+1) == " " || substr(s, lo, lo+1) == "\t" || substr(s, lo, lo+1) == "\r") {
+        lo = lo + 1
+    }
+    for hi > lo && (substr(s, hi-1, hi) == " " || substr(s, hi-1, hi) == "\t" || substr(s, hi-1, hi) == "\r") {
+        hi = hi - 1
+    }
+    out = substr(s, lo, hi)
+}
+
+// Load one .gitignore. `base` is the directory it governs, relative to the scan
+// root, as a prefix like "sub/dir/" (empty at the root).
+func gi_load(path, base) {
+    data := read_file_bytes(path)
+    if len(data) == 0 {
+        return
+    }
+    lines := split(bytes_str(data), "\n")
+    i := 0
+    for i < len(lines) {
+        raw := gi_trim(lines[i])
+        i = i + 1
+        if raw == "" {
+            continue
+        }
+        if substr(raw, 0, 1) == "#" {
+            continue
+        }
+        if contains(raw, "**") || contains(raw, "[") || contains(raw, "\\") {
+            gi_unsupported = gi_unsupported + 1
+            continue
+        }
+        neg := 0
+        if substr(raw, 0, 1) == "!" {
+            neg = 1
+            raw = substr(raw, 1, len(raw))
+        }
+        dironly := 0
+        if len(raw) > 0 && substr(raw, len(raw)-1, len(raw)) == "/" {
+            dironly = 1
+            raw = substr(raw, 0, len(raw)-1)
+        }
+        anchored := 0
+        if len(raw) > 0 && substr(raw, 0, 1) == "/" {
+            anchored = 1
+            raw = substr(raw, 1, len(raw))
+        }
+        if contains(raw, "/") {
+            anchored = 1
+        }
+        if raw == "" {
+            continue
+        }
+        gi_pat = append(gi_pat, raw)
+        gi_neg = append(gi_neg, neg)
+        gi_dironly = append(gi_dironly, dironly)
+        gi_anchored = append(gi_anchored, anchored)
+        gi_base = append(gi_base, base)
+    }
+}
+
+// Glob match supporting * and ? within one segment. Iterative backtracking, so
+// a pathological pattern cannot blow the stack.
+func gi_glob(pat, s) (ok) {
+    pi := 0
+    si := 0
+    star := -1
+    mark := 0
+    ok = false
+    for si < len(s) {
+        pc := ""
+        if pi < len(pat) {
+            pc = substr(pat, pi, pi+1)
+        }
+        if pi < len(pat) && (pc == "?" || pc == substr(s, si, si+1)) {
+            pi = pi + 1
+            si = si + 1
+        } else {
+            if pi < len(pat) && pc == "*" {
+                star = pi
+                mark = si
+                pi = pi + 1
+            } else {
+                if star >= 0 {
+                    pi = star + 1
+                    mark = mark + 1
+                    si = mark
+                } else {
+                    return ok
+                }
+            }
+        }
+    }
+    for pi < len(pat) && substr(pat, pi, pi+1) == "*" {
+        pi = pi + 1
+    }
+    ok = pi == len(pat)
+}
+
+func gi_basename(rel) (b) {
+    cut := -1
+    i := 0
+    for i < len(rel) {
+        if substr(rel, i, i+1) == "/" {
+            cut = i
+        }
+        i = i + 1
+    }
+    b = substr(rel, cut+1, len(rel))
+}
+
+// Is `rel` (path relative to the scan root) ignored? `isdir` selects whether
+// directory-only patterns apply. Last matching rule wins, so a later ! can
+// re-include a path an earlier rule excluded.
+func gi_ignored(rel, isdir) (yes) {
+    yes = false
+    i := 0
+    for i < len(gi_pat) {
+        base := gi_base[i]
+        applies := base == ""
+        if !applies {
+            if len(rel) > len(base) && substr(rel, 0, len(base)) == base {
+                applies = true
+            }
+        }
+        if applies {
+            if gi_dironly[i] == 0 || isdir {
+                sub := substr(rel, len(base), len(rel))
+                hit := false
+                if gi_anchored[i] == 1 {
+                    if gi_glob(gi_pat[i], sub) {
+                        hit = true
+                    }
+                    // an anchored directory pattern also covers everything under it
+                    if !hit && len(sub) > len(gi_pat[i]) {
+                        if substr(sub, 0, len(gi_pat[i])+1) == gi_pat[i] + "/" {
+                            hit = true
+                        }
+                    }
+                } else {
+                    if gi_glob(gi_pat[i], gi_basename(sub)) {
+                        hit = true
+                    }
+                }
+                if hit {
+                    yes = gi_neg[i] == 0
+                }
+            }
+        }
+        i = i + 1
+    }
+}
