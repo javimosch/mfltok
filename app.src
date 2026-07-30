@@ -76,6 +76,7 @@ func usage() {
     println("  mfltok count  [--vocab NAME] [FILE]   token count as JSON")
     println("  mfltok countmany [--vocab NAME]       paths on stdin -> JSON array")
     println("  mfltok scan   [--vocab NAME] [DIR]    walk a repo -> JSON (exclusions counted)")
+    println("                [--human]               human-readable report instead")
     println("  mfltok encode [--vocab NAME] [FILE]   token ids as JSON")
     println("  mfltok selftest FIXTURE [--vocab N]   check against expected ids")
     println("")
@@ -96,15 +97,21 @@ func main() {
     }
 
     vocab := "cl100k_base"
+    want_human := false
     file := ""
     i := 2
     for i < len(a) {
+        if a[i] == "--human" {
+            want_human = true
+            i = i + 1
+        } else {
         if a[i] == "--vocab" && i+1 < len(a) {
             vocab = a[i+1]
             i = i + 2
         } else {
             file = a[i]
             i = i + 1
+        }
         }
     }
 
@@ -135,7 +142,7 @@ func main() {
         if root == "" {
             root = "."
         }
-        run_scan(root, vocab, load_ms)
+        run_scan(root, vocab, load_ms, want_human)
         return
     }
 

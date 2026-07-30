@@ -75,8 +75,15 @@ $ mfltok scan . --vocab o200k_base
  "top":[{"path":"...","tokens":25632,"lang":"MFL"},...]}
 ```
 
+`--human` prints a report instead of JSON.
+
 **Every exclusion is counted.** A scanner that silently drops files reads as
 "I measured everything" when it did not.
+
+`scan` **supersedes [token-optimizer-cli](https://github.com/javimosch/token-optimizer-cli)**,
+which is now deprecated: its `scan`/`audit`/`summary` were three printers over
+one identical computation, and `check` is `mfltok count`. That repo is kept
+un-archived on purpose — its Go scanner is the differential oracle below.
 
 `scan` is what forced `stat`/`is_dir`/`file_size`/`is_symlink` into machin
 itself ([machin#541](https://github.com/javimosch/machin/pull/541), v0.123.0):
