@@ -30,12 +30,34 @@ func encode_text(b) (out) {
     }
 }
 
+// Vocab lookup: $MFLTOK_VOCAB_DIR, else ./vocab, else vocab/ next to the
+// binary. Without the last one `mfltok scan /some/other/repo` fails, because
+// scan is the one verb you normally run from somewhere else.
 func vocab_path(name) (p) {
     base := env("MFLTOK_VOCAB_DIR")
-    if base == "" {
-        base = "vocab"
+    if base != "" {
+        p = base + "/" + name + ".tiktoken"
+        return p
     }
-    p = base + "/" + name + ".tiktoken"
+    p = "vocab/" + name + ".tiktoken"
+    if file_size(p) > 0 {
+        return p
+    }
+    self := args()[0]
+    cut := -1
+    i := 0
+    for i < len(self) {
+        if substr(self, i, i+1) == "/" {
+            cut = i
+        }
+        i = i + 1
+    }
+    if cut > 0 {
+        alt := substr(self, 0, cut) + "/vocab/" + name + ".tiktoken"
+        if file_size(alt) > 0 {
+            p = alt
+        }
+    }
 }
 
 func ints_json(xs) (s) {
@@ -53,6 +75,7 @@ func usage() {
     println("")
     println("  mfltok count  [--vocab NAME] [FILE]   token count as JSON")
     println("  mfltok countmany [--vocab NAME]       paths on stdin -> JSON array")
+    println("  mfltok scan   [--vocab NAME] [DIR]    walk a repo -> JSON (exclusions counted)")
     println("  mfltok encode [--vocab NAME] [FILE]   token ids as JSON")
     println("  mfltok selftest FIXTURE [--vocab N]   check against expected ids")
     println("")
@@ -104,6 +127,15 @@ func main() {
             exit(2)
         }
         run_selftest(file, load_ms)
+        return
+    }
+
+    if cmd == "scan" {
+        root := file
+        if root == "" {
+            root = "."
+        }
+        run_scan(root, vocab, load_ms)
         return
     }
 

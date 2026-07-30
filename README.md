@@ -59,10 +59,51 @@ Point `MFLTOK_VOCAB_DIR` elsewhere if you like (default `./vocab`).
 ## Use
 
 ```
-mfltok count  [--vocab NAME] [FILE]   token count as JSON
-mfltok encode [--vocab NAME] [FILE]   token ids as JSON
-mfltok selftest FIXTURE [--vocab N]   conformance check
+mfltok count     [--vocab NAME] [FILE]   token count as JSON
+mfltok countmany [--vocab NAME]          paths on stdin -> JSON array
+mfltok scan      [--vocab NAME] [DIR]    walk a repo -> JSON
+mfltok encode    [--vocab NAME] [FILE]   token ids as JSON
+mfltok selftest  FIXTURE [--vocab N]     conformance check
 ```
+
+`scan` walks a tree and reports exact per-file cost, top files, and bloat:
+
+```bash
+$ mfltok scan . --vocab o200k_base
+{"vocab":"o200k_base","root":".","files":517,"tokens":1669425,...
+ "skipped":{"vendor_dirs":19,"binary":32,"over_10mb":0,"symlinks":0,"dotfiles":12},
+ "top":[{"path":"...","tokens":25632,"lang":"MFL"},...]}
+```
+
+**Every exclusion is counted.** A scanner that silently drops files reads as
+"I measured everything" when it did not.
+
+`scan` is what forced `stat`/`is_dir`/`file_size`/`is_symlink` into machin
+itself ([machin#541](https://github.com/javimosch/machin/pull/541), v0.123.0):
+walking a tree, skipping vendor directories and skipping files over 10 MB were
+all inexpressible in MFL before it. `is_symlink` is why the walk terminates — a
+symlink to a directory is `is_dir=true`, so without `lstat` a link pointing back
+up the tree loops forever.
+
+### Validated against the Go implementation
+
+`scan` was written by porting token-optimizer-cli's Go scanner, so the two can
+be diffed. On the machin repo (3,000+ files) they first disagreed wildly —
+3,215 files / 7.1M tokens vs 557 files / 44.6M — and **each had a distinct bug**:
+
+- **Go** counted extensionless binaries. `bin/machin` (8.1 MB, no extension,
+  under the size cap) tokenized to **5,870,023 junk tokens** from one file. Both
+  now use a NUL byte in the file's head as the content test, which needs no
+  filename list.
+- **MFL** skipped dot*files* but descended into dot*directories*, walking three
+  whole repo copies under `.claude/worktrees/`.
+
+After both fixes: **517 files / 1,669,425 tokens** (MFL) vs **529 /
+1,670,134** (Go). The remaining gap is 12 files and 709 tokens, fully
+accounted for and purely a difference in rule: Go excludes dot-paths only at
+the repo root (`HasPrefix(rel, ".")`), so `.gitignore` is skipped but
+`selfhost/.gitignore` is not; mfltok excludes them at any depth. Neither is
+"wrong", but only one is consistent.
 
 `FILE` defaults to stdin. `--vocab` is `cl100k_base` (GPT-4, GPT-3.5) or
 `o200k_base` (GPT-4o, o-series). Agent-first contract: **stdout is JSON**,
