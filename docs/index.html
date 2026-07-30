@@ -1,0 +1,243 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>mfltok — an exact token counter</title>
+<meta name="description" content="An exact GPT tokenizer in one static binary. Byte-identical to tiktoken across 166,350 checks, and faster on every axis.">
+<meta property="og:title" content="mfltok — an exact token counter">
+<meta property="og:description" content="Measures what your code costs an AI, instead of estimating it. One static binary, no Python.">
+<link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>⚖️</text></svg>">
+<style>
+  /* Palette drawn from measuring instruments: cool steel neutrals (a grey
+     biased blue, not a default mid-grey) against one warm calibration amber
+     reserved exclusively for measured values. Nothing else is amber, so an
+     amber number always means "this was measured". */
+  :root {
+    --paper:#F4F6F7; --card:#FFFFFF; --ink:#12171C; --steel:#58646F;
+    --steel-dim:#8A959F; --rule:#DBE0E4; --amber:#9A5209; --waste:#A32218;
+    --good:#1B6340;
+    --shadow:0 1px 2px rgba(18,23,28,.05), 0 8px 24px -12px rgba(18,23,28,.18);
+    --mono:ui-monospace,"SF Mono","Cascadia Mono","Roboto Mono",Menlo,Consolas,monospace;
+    --sans:ui-sans-serif,system-ui,-apple-system,"Segoe UI",Roboto,Helvetica,Arial,sans-serif;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --paper:#101418; --card:#171D23; --ink:#E8ECEF; --steel:#9AA6B1;
+      --steel-dim:#69747E; --rule:#262E36; --amber:#E9A94A; --waste:#E8776B;
+      --good:#6FC79A;
+      --shadow:0 1px 2px rgba(0,0,0,.4), 0 8px 24px -12px rgba(0,0,0,.6);
+    }
+  }
+  * { box-sizing: border-box; }
+  html { -webkit-text-size-adjust: 100%; }
+  body {
+    margin:0; background:var(--paper); color:var(--ink);
+    font-family:var(--sans); font-size:17px; line-height:1.65;
+    -webkit-font-smoothing:antialiased;
+  }
+  .wrap {
+    max-width:44rem; margin:0 auto;
+    padding:clamp(2.5rem,6vw,5rem) clamp(1.15rem,5vw,2rem) 6rem;
+    display:flex; flex-direction:column; gap:3.25rem;
+  }
+  h1,h2,h3 { text-wrap:balance; margin:0; line-height:1.15; }
+  h1 { font-size:clamp(2.1rem,6.5vw,3.1rem); font-weight:680; letter-spacing:-.025em; }
+  h2 { font-size:1.42rem; font-weight:640; letter-spacing:-.014em; }
+  h3 { font-size:1.02rem; font-weight:640; }
+  p { margin:0; }
+  a { color:var(--amber); text-underline-offset:.18em; }
+  a:focus-visible, .cmd:focus-visible { outline:2px solid var(--amber); outline-offset:3px; border-radius:2px; }
+  .eyebrow {
+    font-family:var(--mono); font-size:.7rem; letter-spacing:.17em;
+    text-transform:uppercase; color:var(--steel-dim);
+  }
+  .lede { font-size:1.16rem; color:var(--steel); }
+  .note { font-size:.875rem; color:var(--steel-dim); }
+  section { display:flex; flex-direction:column; gap:1.1rem; }
+  .stack { display:flex; flex-direction:column; gap:.8rem; }
+
+  /* the readout: big tabular figures are the identity — the subject is
+     measurement, so the numerals are the typography */
+  .readout {
+    background:var(--card); border:1px solid var(--rule); border-radius:3px;
+    box-shadow:var(--shadow); padding:1.6rem 1.5rem 1.4rem;
+    display:flex; flex-direction:column; gap:.3rem;
+  }
+  .figure {
+    font-family:var(--mono); font-variant-numeric:tabular-nums;
+    font-size:clamp(2.4rem,9vw,3.8rem); font-weight:600;
+    letter-spacing:-.04em; line-height:1; color:var(--amber);
+  }
+  .unit { font-size:.42em; letter-spacing:0; color:var(--steel-dim); font-weight:500; }
+
+  .tablewrap { overflow-x:auto; }
+  table { border-collapse:collapse; width:100%; font-size:.94rem; }
+  caption {
+    text-align:left; color:var(--steel-dim); font-size:.82rem;
+    padding-bottom:.6rem; font-family:var(--mono); letter-spacing:.04em;
+  }
+  th,td { padding:.68rem .8rem; border-bottom:1px solid var(--rule); text-align:left; }
+  thead th {
+    font-size:.72rem; text-transform:uppercase; letter-spacing:.1em;
+    color:var(--steel-dim); font-weight:600; border-bottom-width:1.5px;
+  }
+  td.num {
+    font-family:var(--mono); font-variant-numeric:tabular-nums;
+    text-align:right; white-space:nowrap; font-weight:550;
+  }
+  .win { color:var(--good); } .zero { color:var(--steel-dim); }
+  tbody tr:last-child td { border-bottom:none; }
+
+  .cmd {
+    font-family:var(--mono); font-size:.88rem; background:var(--card);
+    border:1px solid var(--rule); border-left:3px solid var(--amber);
+    border-radius:2px; padding:.75rem .9rem; overflow-x:auto;
+    white-space:pre; color:var(--ink); margin:0;
+  }
+  .cmd .c { color:var(--steel-dim); }
+  .btn {
+    display:inline-block; font-family:var(--mono); font-size:.85rem;
+    text-decoration:none; border:1px solid var(--amber); color:var(--amber);
+    padding:.55rem 1rem; border-radius:2px; letter-spacing:.02em;
+  }
+  .btn:hover { background:var(--amber); color:var(--paper); }
+  hr { border:none; border-top:1px solid var(--rule); margin:0; }
+  .foot { color:var(--steel-dim); font-size:.84rem; display:flex; flex-direction:column; gap:.5rem; }
+</style>
+</head>
+<body>
+<div class="wrap">
+
+  <header class="stack">
+    <p class="eyebrow">mfltok · open source · MIT</p>
+    <h1>An exact token counter</h1>
+    <p class="lede">
+      Every time an AI assistant reads a file, you pay by the token. Most tools that
+      count them are estimating. This one measures — and it is one static binary, with
+      no Python and no runtime.
+    </p>
+    <p><a class="btn" href="https://github.com/javimosch/mfltok">View on GitHub →</a></p>
+  </header>
+
+  <div class="readout">
+    <p class="eyebrow">Verified against the reference implementation</p>
+    <p class="figure">166,350 <span class="unit">checks · 0 mismatches</span></p>
+    <p class="note">
+      Hand-picked edge cases, 20,000 seeded random inputs per encoding, every whitespace
+      string up to four characters exhaustively, and an exhaustive Unicode letter-class
+      corpus. Byte-identical to <code>tiktoken</code> on all of them.
+    </p>
+  </div>
+
+  <section>
+    <h2>Why estimates aren't good enough</h2>
+    <p>
+      The usual shortcut is characters ÷ 4. We measured our own estimator against the real
+      thing: it undercounted by <strong>18.6 %</strong> — and, worse, <em>unevenly</em>.
+      Dense files were off by 25 %, simple ones by 6 %. So the list of your biggest files
+      came out in the wrong order. The ranking was wrong, not just the totals.
+    </p>
+  </section>
+
+  <hr>
+
+  <section>
+    <h2>Faster and smaller than the reference</h2>
+    <p>445 kB of source, identical output — 214,650 tokens both sides:</p>
+    <div class="tablewrap">
+      <table>
+        <caption>lower is better on every column</caption>
+        <thead>
+          <tr><th scope="col"></th><th scope="col" style="text-align:right">Start → answer</th><th scope="col" style="text-align:right">Encode</th><th scope="col" style="text-align:right">Memory</th></tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td><strong>mfltok</strong></td>
+            <td class="num win">0.08 s</td><td class="num win">57 ms</td><td class="num win">56 MB</td>
+          </tr>
+          <tr>
+            <td>Python + tiktoken <span class="note">(Rust core)</span></td>
+            <td class="num">0.37 s</td><td class="num">87 ms</td><td class="num">68 MB</td>
+          </tr>
+        </tbody>
+      </table>
+    </div>
+    <p class="note">
+      Written in <a href="https://github.com/javimosch/machin">machin</a> (MFL), which had
+      no tokenizer library and no package registry — so the Unicode tables, the
+      pretokenizer and the merge loop are all from scratch. Building the repo scanner
+      pushed four new builtins into the language itself.
+    </p>
+  </section>
+
+  <hr>
+
+  <section>
+    <h2>What actually lowers the bill</h2>
+    <p>Once you can measure honestly, most common advice stops surviving the numbers:</p>
+    <div class="tablewrap">
+      <table>
+        <caption>measured over 10,497 tokens of real source</caption>
+        <thead>
+          <tr><th scope="col">Suggested fix</th><th scope="col" style="text-align:right">Effect</th></tr>
+        </thead>
+        <tbody>
+          <tr><td>Split a big file into smaller ones</td><td class="num zero">−0.03 %</td></tr>
+          <tr><td>Reflow long lines</td><td class="num zero">+0.18 %</td></tr>
+          <tr><td>Don't load the file at all</td><td class="num win">−100 %</td></tr>
+        </tbody>
+      </table>
+    </div>
+    <p>
+      You cannot reformat your way to a smaller bill. Rearranging the same words costs the
+      same. The only lever is deciding what the assistant never needs to see.
+    </p>
+  </section>
+
+  <hr>
+
+  <section>
+    <h2>Using it</h2>
+    <div class="stack">
+      <pre class="cmd" tabindex="0">git clone https://github.com/javimosch/mfltok
+cd mfltok &amp;&amp; ./setup.sh &amp;&amp; ./build.sh</pre>
+      <pre class="cmd" tabindex="0">mfltok scan . --human   <span class="c"># a report you read</span>
+mfltok scan .           <span class="c"># JSON, for an agent</span>
+mfltok count FILE       <span class="c"># one file</span></pre>
+      <p class="note">
+        Honours <code>.gitignore</code>, skips binaries by content rather than by filename,
+        and <strong>counts every exclusion</strong> — a scanner that quietly drops files
+        while implying it measured everything is the thing this was built to avoid.
+      </p>
+    </div>
+  </section>
+
+  <hr>
+
+  <section>
+    <h2>What it will not tell you</h2>
+    <p>
+      It never claims to have saved you anything. It is a measuring instrument: it does not
+      sit between you and the assistant, and it cannot lower a bill by itself.
+    </p>
+    <p class="note">
+      A well-known tool in this space advertised “96.2 million tokens saved” while a
+      controlled experiment found its users' bills had gone <em>up</em> 7.6 %. Any tool
+      that grades its own homework can produce a number like that — so this one publishes
+      no savings figure at all.
+    </p>
+  </section>
+
+  <footer class="foot">
+    <hr>
+    <p>
+      <a href="https://github.com/javimosch/mfltok">github.com/javimosch/mfltok</a> · MIT ·
+      supersedes <a href="https://github.com/javimosch/token-optimizer-cli">token-optimizer-cli</a>
+    </p>
+    <p>Every figure here is a measurement, reproducible from the repository.</p>
+  </footer>
+
+</div>
+</body>
+</html>
