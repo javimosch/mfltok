@@ -2,6 +2,8 @@
 
 **An exact BPE tokenizer in pure [machin](https://github.com/javimosch/machin) (MFL) — one static binary, no Python, no Rust, no `tiktoken`.**
 
+**[▶ javimosch.github.io/mfltok](https://javimosch.github.io/mfltok/)** · plain-language explainer: [what your code costs an AI](https://hart.intrane.fr/a/javimosch/mfltok-explainer)
+
 Counts GPT tokens the way the model actually counts them: real byte-pair encoding over the real rank tables, byte-for-byte identical to [tiktoken](https://github.com/openai/tiktoken) across ~166,000 conformance cases.
 
 ```bash
